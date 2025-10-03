@@ -2,18 +2,42 @@ import os
 import json
 
 import torch
+import torch.nn as nn
 import torchvision.models as models
 import torchvision.datasets.imagenet 
 from PIL import Image
 from torchvision import transforms
 
+MODEL_ARCH = "resnet101"
+
 {"resnet50" : "rn50_relabel_cutmix_IN21k_81.2.pth",
  "resnet101": "rn101_relabel_cutmix_81.6.pth",
  }
-WEIGHT_FILE = "models/naver_relabel_imagenet/rn50_relabel_cutmix_IN21k_81.2.pth"
-EXPORT_PATH = "/home/juanmedrano_eng/repos/micro2025_compiler/micro2025_compiler_DeepX_M1_v1.60.1/OutputDNNXModels/rn50_relabel_cutmix_IN21k_81.2.onnx"
-TEST_IMAGE = "/home/juanmedrano_eng/repos/micro2025_compiler/micro2025_compiler_DeepX_M1_v1.60.1/Calibration_Images_Classification/4.jpeg"
+WEIGHT_FILE = "models/naver_relabel_imagenet/rn101_relabel_cutmix_81.6.pth"
+EXPORT_PATH = "/home/juanmedrano_eng/repos/micro2025_compiler/micro2025_compiler_DeepX_M1_v1.60.1/InputDNNXModels/rn101_relabel_cutmix_81.6.onnx"
+TEST_IMAGE = "/home/juanmedrano_eng/repos/micro2025_compiler/micro2025_compiler_DeepX_M1_v1.60.1/Calibration_Images_Classification/6.jpeg"
 
+def remove_prefix_checkpoint(dictionary, prefix):
+    keys = sorted(dictionary.keys())
+    for key in keys:
+        if key.startswith(prefix):
+            newkey = key[len(prefix) + 1:]
+            dictionary[newkey] = dictionary.pop(key)
+    return dictionary
+
+def load_checkpoint(weight_file, model):
+    if os.path.isfile(weight_file):
+        print(f"=> loading checkpoint '{weight_file}'")
+        checkpoint = torch.load(weight_file)
+
+        if 'state_dict' in checkpoint:
+            checkpoint = checkpoint['state_dict']
+
+        checkpoint = remove_prefix_checkpoint(checkpoint, 'module')
+        model.load_state_dict(checkpoint)
+        print(f"=> checkpoint loaded '{weight_file}'")
+    else:
+        raise Exception(f"=> no checkpoint found at '{weight_file}'")
 
 def load_image_tensor(image_path: str, device: torch.device) -> torch.Tensor:
     """Load image from disk and convert it into a 1x3x224x244 tensor."""
@@ -40,27 +64,16 @@ if __name__ == "__main__":
 
     if os.path.isfile(WEIGHT_FILE):
 
+        # Load initial network architecture
+        if hasattr(torchvision.models, MODEL_ARCH):
+            model = getattr(torchvision.models, MODEL_ARCH)()
+        else:
+            raise ValueError(
+                f"Not supported model architecture {MODEL_ARCH}")
 
-        # Step 1: Initialize the model architecture
-        print("1. Loading Resnet50...")
-        model = models.resnet50(weights=None,)  # no pretrained weights
-        print("  ...model loaded")
-
-        print("2. Loading state dict if any:")
-        # Step 2: Load the saved state dictionary
-        state_dict = torch.load(WEIGHT_FILE, map_location=device)
-        # Some checkpoints save a dict with key 'state_dict', so handle that case
-        if "state_dict" in state_dict:
-            state_dict = state_dict["state_dict"]
-            print(" ... loaded state dict")
-        print(" ... finished loading state dict")
-
-        # Step 3: Load weights into the model
-        print("3. Loading weights into model...")
-        model.load_state_dict(state_dict, strict=True)  # strict=False if keys don’t match perfectly
-        model.eval()
+        load_checkpoint(WEIGHT_FILE, model)
         model.to(device)
-        print("Model loaded successfully!")
+        model.eval()
 
         if os.path.isfile(TEST_IMAGE):
 
