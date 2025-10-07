@@ -61,6 +61,15 @@ except Exception:
     pass
 
 
+from utils.data_loader import load_data_loaders
+from utils.utils import set_dataset_len
+from utils.utils import mch
+from utils.configs import parse_config
+from utils.utils import set_distributed_worker
+from utils.utils import AverageMeterCollection
+
+import warnings
+
 # ---------------------------- Utilities ----------------------------
 
 def set_seed(seed: int = 42):
@@ -89,11 +98,34 @@ def accuracy(output: torch.Tensor, target: torch.Tensor, topk=(1, 5)) -> list:
 
 # ---------------------------- Models ----------------------------
 
+def remove_prefix_checkpoint(dictionary, prefix):
+    keys = sorted(dictionary.keys())
+    for key in keys:
+        if key.startswith(prefix):
+            newkey = key[len(prefix) + 1:]
+            dictionary[newkey] = dictionary.pop(key)
+    return dictionary
+
+def load_checkpoint(weight_file, model):
+    if os.path.isfile(weight_file):
+        print(f"=> loading checkpoint '{weight_file}'")
+        checkpoint = torch.load(weight_file)
+
+        if 'state_dict' in checkpoint:
+            checkpoint = checkpoint['state_dict']
+
+        checkpoint = remove_prefix_checkpoint(checkpoint, 'module')
+        model.load_state_dict(checkpoint)
+        print(f"=> checkpoint loaded '{weight_file}'")
+    else:
+        raise Exception(f"=> no checkpoint found at '{weight_file}'")
+
 class ResNet50Classifier(nn.Module):
     def __init__(self, pretrained: bool = True, freeze_backbone: bool = False, num_classes: int = 1000):
         super().__init__()
         weights = torchvision.models.ResNet50_Weights.IMAGENET1K_V2 if pretrained else None
-        self.net = torchvision.models.resnet50(weights=weights)
+        self.net = torchvision.models.resnet50()
+        load_checkpoint("models/naver_relabel_imagenet/rn50_relabel_cutmix_IN21k_81.2.pth", self.net)
         # ensure classifier has correct num_classes
         in_features = self.net.fc.in_features
         self.net.fc = nn.Linear(in_features, num_classes)
@@ -303,6 +335,7 @@ def grpo_step(
 
     # Sample actions and get their log probs under current policy
     actions, logp = sample_actions(logits, temperature=cfg.temperature)  # [B*G]
+    print("Actions:", actions.shape)
     # Compute rewards per sample (for classification; IoU not supported here)
     # For reward computation we want per-sample logits; reward compares action to targets
     # Option A: Reward based on sampled action correctness
@@ -356,6 +389,102 @@ def grpo_step(
 
 
 # ---------------------------- Data ----------------------------
+
+def get_context(args):
+    ngpus_per_node = torch.cuda.device_count()
+    print(f'device_count : {ngpus_per_node}')
+
+    context = mch()
+
+    # Number of the GPUs per node
+    context.ngpus_per_node = ngpus_per_node
+
+    # Number of the workers per GPU
+    context.num_workers = int((args.compute.num_workers + ngpus_per_node - 1) /
+                              ngpus_per_node)
+
+    # The total number of processes, so that the master knows how many workers
+    # to wait for.
+    if args.compute.distributed.use:
+        context.world_size = args.compute.distributed.num_processes_per_node * \
+                             context.ngpus_per_node
+    else:
+        context.world_size = args.compute.distributed.num_processes_per_node
+
+    # Rank of each process, so they will know whether it is the master of a
+    # worker. Will be set on the set_distributed_worker()
+    context.rank = 0
+
+    # Training batch size per GPU
+    context.batch_size = int(args.optim.batch_size / ngpus_per_node)
+
+    # Validation batch size per GPU
+    context.val_batch_size = int(args.util.val_batch_size / ngpus_per_node)
+
+    # Data path
+    context.data_path = args.data.data_path
+
+    # Number of classes
+    context.num_classes = 1000
+
+    # Dataset length
+    context.train_len, context.val_len = set_dataset_len(
+        batch_size=context.batch_size,
+        val_batch_size=context.val_batch_size,
+        ngpus_per_node=ngpus_per_node)
+
+    return context
+
+def load_context_args(config_file_path, **kwargs):
+
+    args = parse_config(config_fname=config_file_path, **kwargs)
+
+    if args.compute.gpu >= 0:
+        warnings.warn('You have chosen a specific GPU. This will '
+                        'disable data parallelism.')
+
+    # Common set of data passed to workers
+    context = get_context(args)
+
+    torch.set_num_threads(torch.get_num_threads() * 2)
+    print('CPU threads :' + str(torch.get_num_threads()))
+    return context, args
+
+def train_obs_args(loader, batch_fn, args, context):
+    meters = AverageMeterCollection('batch_time', 'losses', 'acc1', 'acc5')
+    train_objs = mch(
+        loader=loader,
+        batch_fn=batch_fn,
+        meters=meters
+    )
+    train_args = mch(
+        epochs=args.optim.epochs,
+        warmup_lr=args.optim.warmup.lr,
+        warmup_epochs=args.optim.warmup.epochs,
+        num_classes=context.num_classes,
+        len=context.train_len,
+        use_relabel=args.data.relabel.use,
+    )
+    return train_objs, train_args
+
+def get_relabeled_image_target(train_objs, train_args, batch):
+
+    if train_args.use_relabel:
+        # load ReLabel ground truth
+        image, target_original, target_relabel = train_objs.batch_fn(
+            batch=batch,
+            num_classes=train_args.num_classes,
+            mode='train')
+        target_original = target_original.cuda()
+        target = target_relabel
+    else:
+        # load original imagenet ground truth
+        image, target_original = train_objs.batch_fn(batch=batch,
+                                                        num_classes=train_args.num_classes,
+                                                        mode='train')
+        target_original = target_original.cuda()
+        target = target_original
+    return image, target
 
 def build_imagenet_loaders(data_root: str, batch_size: int, num_workers: int = 8, img_size: int = 224):
     """
@@ -445,13 +574,18 @@ def main():
     parser.add_argument("--head_only", action="store_true", help="Update only classification head")
     parser.add_argument("--eval_interval", type=int, default=50, help="Validate every N GRPO steps")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--config_file_path", type=str, required=True)
     args = parser.parse_args()
 
     set_seed(args.seed)
+    context, extra_args = load_context_args(args.config_file_path)
+
+    set_distributed_worker(extra_args.compute.gpu, extra_args, context)
+    train_loader, val_loader, batch_fn =  load_data_loaders(dataset="imagenet", args=extra_args, context=context)
 
     device = args.device
-    train_loader, val_loader = build_imagenet_loaders(args.data_root, batch_size=args.batch_size,
-                                                      num_workers=args.num_workers, img_size=args.img_size)
+    # train_loader, val_loader = build_imagenet_loaders(args.data_root, batch_size=args.batch_size,
+    #                                                   num_workers=args.num_workers, img_size=args.img_size)
 
     # Build model and frozen reference
     model, ref_model = build_model(args.model, head_only=args.head_only, num_classes=1000)
@@ -476,15 +610,22 @@ def main():
     best_top1 = -1.0
 
     # Simple infinite iterator over train loader
-    train_iter = iter(train_loader)
+    #train_iter = iter(train_loader)
 
-    while step < args.grpo_steps:
-        try:
-            images, targets = next(train_iter)
-        except StopIteration:
-            train_iter = iter(train_loader)
-            images, targets = next(train_iter)
+    train_obj, train_args = train_obs_args(train_loader, batch_fn, extra_args, context)
 
+    #while step < args.grpo_steps:
+    for iteration, batch in enumerate(train_obj.loader):
+        # try:
+        #     out = next(train_iter)
+        #     print("Output: ", len(out), type(out))
+        #     images, targets = next(train_iter)
+        # except StopIteration:
+        #     train_iter = iter(train_loader)
+        #     images, targets = next(train_iter)
+
+        images, targets = get_relabeled_image_target(train_obj, train_args, batch)
+        print("Targets:", targets.shape)
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
@@ -506,7 +647,9 @@ def main():
                             "config": vars(args),
                             "val_top1": best_top1}, save_path)
                 print(f"  >> Saved checkpoint: {save_path} (best top1={best_top1:.2f})", flush=True)
-
+        
+        if step > args.grpo_steps:
+            break 
 
 if __name__ == "__main__":
     main()
