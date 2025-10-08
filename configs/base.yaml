@@ -13,7 +13,7 @@ optim:
   bn:
     momentum: 0.9
     eps: 1.e-5
-  batch_size: 64
+  batch_size: 8
   lr:
     init: 0.5
     decay_type: 'cos'

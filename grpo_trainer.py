@@ -37,6 +37,8 @@ USAGE (examples):
       --reward bandit
 
 """
+
+#python grpo_trainer.py --model resnet50 --data_root datasets/imagenet-mini --batch_size 8 --group_size 4 --grpo_steps 10000 --head_only --reward bandit --aux_ce_coef 0.1 --kl_coef 0.02 --config_file_path configs/relabel_train_resnet50.yaml
 import argparse
 import math
 import os
@@ -335,7 +337,7 @@ def grpo_step(
 
     # Sample actions and get their log probs under current policy
     actions, logp = sample_actions(logits, temperature=cfg.temperature)  # [B*G]
-    print("Actions:", actions.shape)
+    #print("Actions:", actions.shape)
     # Compute rewards per sample (for classification; IoU not supported here)
     # For reward computation we want per-sample logits; reward compares action to targets
     # Option A: Reward based on sampled action correctness
@@ -625,7 +627,7 @@ def main():
         #     images, targets = next(train_iter)
 
         images, targets = get_relabeled_image_target(train_obj, train_args, batch)
-        print("Targets:", targets.shape)
+        #print("Targets:", targets.shape)
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 

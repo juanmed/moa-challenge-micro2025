@@ -92,13 +92,14 @@ def get_torch_dataloader(data_path, batch_size, val_batch_size,
 
     def original_batch_fn(batch, num_classes=1000):
         images = batch[0]
-        original_label = to_one_hot(batch[1], num_classes)
+        original_label = batch[1] # to_one_hot(batch[1], num_classes)
 
         return images, original_label
 
     def relabel_batch_fn(batch, num_classes=1000, mode=None):
         images = batch[0]
-        original_label = to_one_hot(batch[1], num_classes)
+        #print("Before relabel batch:", batch[1].shape)
+        original_label = batch[1] # to_one_hot(batch[1], num_classes)
 
         if mode == 'val':
             return images, original_label
@@ -115,13 +116,14 @@ def get_torch_dataloader(data_path, batch_size, val_batch_size,
         # make full tensor from sparse top-k label maps
         label_maps = get_labelmaps(label_maps_topk=label_maps,
                                    num_batches=num_batches)
-
+        #print("label_maps:", label_maps.shape)
         # LabelPooling operation
         relabel = get_relabel(label_maps=label_maps,
                               batch_coords=random_crop_coords,
                               num_batches=num_batches)
-
-        return images, original_label, relabel
+        #print("relabel:", relabel.shape)
+        idx = relabel.argmax(dim=1)
+        return images, original_label, idx
 
     print(f"Training epoch size: {len(train_loader.dataset)}")
     print(f"Validation epoch size: {len(val_loader.dataset)}")
