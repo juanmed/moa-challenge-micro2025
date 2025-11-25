@@ -31,10 +31,10 @@ compute:
   opt_level: 'O1'
   num_workers: 4
   distributed:
-    use: True
+    use: False
     num_processes_per_node: 1
     url: 'tcp://127.0.0.1:6946'
     backend: 'nccl'
 util:
   print_freq: 250
-  val_batch_size: 512
+  val_batch_size: 32

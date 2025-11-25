@@ -69,6 +69,8 @@ from utils.utils import mch
 from utils.configs import parse_config
 from utils.utils import set_distributed_worker
 from utils.utils import AverageMeterCollection
+from utils.data_augment import squeeze_one_hot
+
 
 import warnings
 
@@ -135,7 +137,10 @@ class ResNet50Classifier(nn.Module):
         if freeze_backbone:
             for name, p in self.net.named_parameters():
                 if not name.startswith("fc."):
+                    print(f"Layer: {name} NO grad")
                     p.requires_grad = False
+                else:
+                    print(f"***** Layer: {name} WITH GRAD ******")
 
     def forward(self, x):
         return self.net(x)
@@ -469,6 +474,19 @@ def train_obs_args(loader, batch_fn, args, context):
     )
     return train_objs, train_args
 
+def val_objs_args(loader, model, batch_fn, context):
+    val_objs = mch(
+        loader=loader,
+        model=model,
+        batch_fn=batch_fn,
+    )
+    val_args = mch(
+        num_classes=context.num_classes,
+        len=context.val_len,
+    )
+
+    return val_objs, val_args
+
 def get_relabeled_image_target(train_objs, train_args, batch):
 
     if train_args.use_relabel:
@@ -529,10 +547,19 @@ def build_imagenet_loaders(data_root: str, batch_size: int, num_workers: int = 8
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, val_loader: DataLoader, device: str = "cuda") -> Dict[str, float]:
+#def evaluate(model: nn.Module, val_loader: DataLoader, device: str = "cuda") -> Dict[str, float]:
+def evaluate(model: nn.Module, val_loader: DataLoader, batch_fn, context, device: str = "cuda"):
     model.eval()
     total, correct1, correct5 = 0, 0, 0
-    for images, targets in val_loader:
+
+    val_objs, val_args = val_objs_args(val_loader, model, batch_fn, context)
+
+    for iteration, batch in enumerate(val_objs.loader):
+        images, targets = val_objs.batch_fn(batch=batch,
+                                    num_classes=val_args.num_classes,
+                                    mode='val')
+        targets = squeeze_one_hot(targets)
+    #for images, targets in val_loader:
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
         logits = model(images)
@@ -594,6 +621,12 @@ def main():
     model.to(device)
     ref_model.to(device)
 
+    print("\n\n *** Validation round: ")
+    val_logs = evaluate(model, val_loader, batch_fn, context, device)
+    print(f"  >> VAL @ step VERIFICATION: top1={val_logs['val_top1']:.2f} top5={val_logs['val_top5']:.2f}", flush=True)
+    print("\n\n *** Finish Validation round **** \n\n ")
+
+
     # Optimizer (only params that require grad)
     optim = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
                               lr=args.lr, weight_decay=args.weight_decay)
@@ -616,42 +649,44 @@ def main():
 
     train_obj, train_args = train_obs_args(train_loader, batch_fn, extra_args, context)
 
-    #while step < args.grpo_steps:
-    for iteration, batch in enumerate(train_obj.loader):
-        # try:
-        #     out = next(train_iter)
-        #     print("Output: ", len(out), type(out))
-        #     images, targets = next(train_iter)
-        # except StopIteration:
-        #     train_iter = iter(train_loader)
-        #     images, targets = next(train_iter)
+    while step < args.grpo_steps:
 
-        images, targets = get_relabeled_image_target(train_obj, train_args, batch)
-        #print("Targets:", targets.shape)
-        images = images.to(device, non_blocking=True)
-        targets = targets.to(device, non_blocking=True)
+        for iteration, batch in enumerate(train_obj.loader):
+            # try:
+            #     out = next(train_iter)
+            #     print("Output: ", len(out), type(out))
+            #     images, targets = next(train_iter)
+            # except StopIteration:
+            #     train_iter = iter(train_loader)
+            #     images, targets = next(train_iter)
+    
+            images, targets = get_relabeled_image_target(train_obj, train_args, batch)
+            #print("Targets:", targets.shape)
+            images = images.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
 
-        logs = grpo_step(model, ref_model, images, targets, optim, cfg, device=device)
+            logs = grpo_step(model, ref_model, images, targets, optim, cfg, device=device)
 
-        step += 1
-        if step % 10 == 0:
-            print(f"[Step {step:04d}] loss={logs['loss']:.4f} pg={logs['pg_loss']:.4f} "
-                  f"kl={logs['kl']:.4f} aux={logs['aux_ce']:.4f} "
-                  f"top1={logs['top1']:.2f} top5={logs['top5']:.2f}", flush=True)
+            step += 1
+            if step % 10 == 0:
+                print(f"[Step {step:04d}] loss={logs['loss']:.4f} pg={logs['pg_loss']:.4f} "
+                    f"kl={logs['kl']:.4f} aux={logs['aux_ce']:.4f} "
+                    f"top1={logs['top1']:.2f} top5={logs['top5']:.2f}", flush=True)
 
-        if step % args.eval_interval == 0 or step == args.grpo_steps:
-            val_logs = evaluate(model, val_loader, device=device)
-            print(f"  >> VAL @ step {step}: top1={val_logs['val_top1']:.2f} top5={val_logs['val_top5']:.2f}", flush=True)
-            if val_logs["val_top1"] > best_top1:
-                best_top1 = val_logs["val_top1"]
-                save_path = f"best_{args.model}_grpo.pt"
-                torch.save({"model": model.state_dict(),
-                            "config": vars(args),
-                            "val_top1": best_top1}, save_path)
-                print(f"  >> Saved checkpoint: {save_path} (best top1={best_top1:.2f})", flush=True)
-        
-        if step > args.grpo_steps:
-            break 
+            if step % args.eval_interval == 0 or step == args.grpo_steps:
+                val_logs = evaluate(model, val_loader, batch_fn, context, device)
+                print(f"  >> VAL @ step {step}: top1={val_logs['val_top1']:.2f} top5={val_logs['val_top5']:.2f}", flush=True)
+                if val_logs["val_top1"] > best_top1:
+                    best_top1 = val_logs["val_top1"]
+                    save_path = f"best_{args.model}_grpo.pt"
+                    torch.save({"model": model.state_dict(),
+                                "config": vars(args),
+                                "val_top1": best_top1}, save_path)
+                    print(f"  >> Saved checkpoint: {save_path} (best top1={best_top1:.2f})", flush=True)
+            
+            # if step > args.grpo_steps:
+            #     print(f"Step: {step}, GRPO Steps: {args.grpo_steps}")
+            #     break 
 
 if __name__ == "__main__":
     main()
